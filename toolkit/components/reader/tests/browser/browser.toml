@@ -43,6 +43,9 @@ support-files = ["readerModeArticle.html"]
 ["browser_readerMode_hidden_nodes.js"]
 support-files = ["readerModeArticleHiddenNodes.html"]
 
+["browser_readerMode_metadata_lifetime.js"]
+support-files = ["readerModeArticleTextPlain.txt"]
+
 ["browser_readerMode_menu.js"]
 support-files = ["readerModeArticleShort.html"]
 

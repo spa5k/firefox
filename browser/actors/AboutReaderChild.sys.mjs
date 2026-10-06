@@ -10,8 +10,67 @@ ChromeUtils.defineESModuleGetters(lazy, {
   Readerable: "resource://gre/modules/Readerable.sys.mjs",
 });
 
-var gUrlsToDocContentType = new Map();
-var gUrlsToDocTitle = new Map();
+let gCachedDocMetadata = new Map();
+let gPendingDocMetadata = new Map();
+let gDocMetadataGeneration = 0;
+
+function forgetPendingDocMetadata(browserId) {
+  if (gPendingDocMetadata.delete(browserId) && !gPendingDocMetadata.size) {
+    Services.obs.removeObserver(
+      onBrowsingContextDiscarded,
+      "browsing-context-discarded"
+    );
+  }
+}
+
+function onBrowsingContextDiscarded(browsingContext) {
+  const browserId = browsingContext.browserId;
+  Services.tm.dispatchToMainThread(() => {
+    if (!BrowsingContext.getCurrentTopByBrowserId(browserId)) {
+      forgetPendingDocMetadata(browserId);
+    }
+  });
+}
+
+function cachePendingDocMetadata(browserId, document) {
+  if (!gPendingDocMetadata.size) {
+    Services.obs.addObserver(
+      onBrowsingContextDiscarded,
+      "browsing-context-discarded"
+    );
+  }
+  gPendingDocMetadata.set(browserId, {
+    url: document.URL,
+    contentType: document.contentType,
+    title: document.title,
+    generation: ++gDocMetadataGeneration,
+  });
+}
+
+function getDocMetadata(browserId, url) {
+  let metadata = gCachedDocMetadata.get(url);
+  const ownPending = gPendingDocMetadata.get(browserId);
+  if (ownPending?.url === url) {
+    metadata = ownPending;
+    forgetPendingDocMetadata(browserId);
+  } else {
+    for (const pending of gPendingDocMetadata.values()) {
+      if (
+        pending.url === url &&
+        (!metadata || pending.generation > metadata.generation)
+      ) {
+        metadata = pending;
+      }
+    }
+  }
+  if (
+    metadata &&
+    metadata.generation >= (gCachedDocMetadata.get(url)?.generation ?? 0)
+  ) {
+    gCachedDocMetadata.set(url, metadata);
+  }
+  return metadata;
+}
 
 export class AboutReaderChild extends JSWindowActorChild {
   constructor() {
@@ -38,11 +97,10 @@ export class AboutReaderChild extends JSWindowActorChild {
     switch (message.name) {
       case "Reader:ToggleReaderMode":
         if (!this.isAboutReader) {
-          gUrlsToDocContentType.set(
-            this.document.URL,
-            this.document.contentType
+          cachePendingDocMetadata(
+            this.browsingContext.browserId,
+            this.document
           );
-          gUrlsToDocTitle.set(this.document.URL, this.document.title);
           this._articlePromise = lazy.ReaderMode.parseDocument(
             this.document
           ).catch(console.error);
@@ -108,12 +166,11 @@ export class AboutReaderChild extends JSWindowActorChild {
           }
           // Update the toolbar icon to show the "reader active" icon.
           this.sendAsyncMessage("Reader:UpdateReaderButton");
+          const metadata = getDocMetadata(this.browsingContext.browserId, url);
           let docContentType =
-            gUrlsToDocContentType.get(url) === "text/plain"
-              ? "text/plain"
-              : "document";
+            metadata?.contentType === "text/plain" ? "text/plain" : "document";
 
-          let docTitle = gUrlsToDocTitle.get(url);
+          let docTitle = metadata?.title;
           this._reader = new lazy.AboutReader(
             this,
             this._articlePromise,
