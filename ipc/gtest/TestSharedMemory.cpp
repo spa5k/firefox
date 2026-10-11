@@ -8,9 +8,14 @@
 #include "chrome/common/ipc_message_utils.h"
 #include "gtest/gtest.h"
 
+#include "mozilla/ScopeExit.h"
+#include "mozilla/SpinEventLoopUntil.h"
 #include "mozilla/ipc/SharedMemoryCursor.h"
 #include "mozilla/ipc/SharedMemoryHandle.h"
 #include "mozilla/ipc/SharedMemoryMapping.h"
+#include "nsIMemoryReporter.h"
+#include "nsITimer.h"
+#include "nsServiceManagerUtils.h"
 
 #include <bit>
 
@@ -29,6 +34,56 @@
 
 namespace mozilla::ipc {
 
+using namespace mozilla::literals;
+
+class ShmemAllocationReportCallback final : public nsIHandleReportCallback {
+ public:
+  NS_DECL_ISUPPORTS
+
+  NS_IMETHOD Callback(const nsACString&, const nsACString& aPath, int32_t,
+                      int32_t, int64_t aAmount, const nsACString&,
+                      nsISupports*) override {
+    if (aPath.EqualsLiteral("shmem-allocated")) {
+      mFound = true;
+      mAmount = aAmount;
+    }
+    return NS_OK;
+  }
+
+  bool Found() const { return mFound; }
+  int64_t Amount() const { return mAmount; }
+
+ private:
+  ~ShmemAllocationReportCallback() = default;
+
+  bool mFound = false;
+  int64_t mAmount = 0;
+};
+
+NS_IMPL_ISUPPORTS(ShmemAllocationReportCallback, nsIHandleReportCallback)
+
+class ShmemAllocationFinishCallback final : public nsIFinishReportingCallback {
+ public:
+  NS_DECL_ISUPPORTS
+
+  NS_IMETHOD Callback(nsISupports*) override {
+    mFinished = true;
+    return NS_OK;
+  }
+
+  bool Finished() const { return mFinished; }
+  bool TimedOut() const { return mTimedOut; }
+  void Timeout() { mTimedOut = true; }
+
+ private:
+  ~ShmemAllocationFinishCallback() = default;
+
+  bool mFinished = false;
+  bool mTimedOut = false;
+};
+
+NS_IMPL_ISUPPORTS(ShmemAllocationFinishCallback, nsIFinishReportingCallback)
+
 struct SharedMemoryInternalTest : public testing::Test {
   // Changes our idea of the size without changing the size of the OS object;
   // mappings could fail, or could succeed but crash on access.
@@ -45,6 +100,60 @@ struct SharedMemoryInternalTest : public testing::Test {
   shared_memory::MutableHandle UnsafeThaw(
       shared_memory::ReadOnlyHandle&& aHandle) {
     return UnsafeConvertTo<shared_memory::Type::Mutable>(std::move(aHandle));
+  }
+
+  uint64_t ReportedAllocationSize() {
+    nsCOMPtr<nsIMemoryReporterManager> manager =
+        do_GetService("@mozilla.org/memory-reporter-manager;1");
+    if (!manager) {
+      ADD_FAILURE() << "Memory reporter manager is unavailable";
+      return 0;
+    }
+
+    RefPtr report = new ShmemAllocationReportCallback();
+    RefPtr finish = new ShmemAllocationFinishCallback();
+    nsCOMPtr<nsITimer> timer;
+    nsresult rv = NS_NewTimerWithCallback(
+        getter_AddRefs(timer), [finish](nsITimer*) { finish->Timeout(); },
+        10000, nsITimer::TYPE_ONE_SHOT,
+        "ipc:SharedMemoryInternalTest::AllocationReportTimeout"_ns);
+    if (NS_FAILED(rv)) {
+      ADD_FAILURE() << "Memory report timer creation failed";
+      return 0;
+    }
+    auto cancelTimer = MakeScopeExit([&] { timer->Cancel(); });
+
+    rv = manager->GetReportsForThisProcessExtended(report, nullptr, false,
+                                                   nullptr, finish, nullptr);
+    if (NS_FAILED(rv)) {
+      ADD_FAILURE() << "Memory report collection failed";
+      return 0;
+    }
+
+    if (!SpinEventLoopUntil(
+            "ipc:SharedMemoryInternalTest::ReportedAllocationSize"_ns,
+            [&] { return finish->Finished() || finish->TimedOut(); })) {
+      ADD_FAILURE() << "Memory report event loop failed";
+      return 0;
+    }
+    if (finish->TimedOut()) {
+      ADD_FAILURE() << "Memory report collection timed out";
+      return 0;
+    }
+    EXPECT_TRUE(report->Found());
+    EXPECT_GE(report->Amount(), 0);
+    return uint64_t(report->Amount());
+  }
+
+  uint64_t AllocationBaseline() {
+    {
+      auto registrationHandle = shared_memory::Create(1);
+      if (!registrationHandle) {
+        ADD_FAILURE() << "Shared-memory registration handle creation failed";
+        return 0;
+      }
+    }
+    return ReportedAllocationSize();
   }
 };
 
@@ -100,6 +209,90 @@ TEST(IPCSharedMemoryHandle, Move)
   assignedHandle = std::move(newHandle);
   ASSERT_SHMEM(newHandle, 0);
   ASSERT_SHMEM(assignedHandle, 1);
+}
+
+TEST_F(SharedMemoryInternalTest, MoveAssignmentCounterToEmpty) {
+  static constexpr uint64_t kSize = 4096;
+  const uint64_t baseline = AllocationBaseline();
+
+  {
+    auto source = shared_memory::Create(kSize);
+    shared_memory::MutableHandle destination;
+    EXPECT_EQ(ReportedAllocationSize(), baseline + kSize);
+
+    destination = std::move(source);
+    ASSERT_SHMEM(source, 0);
+    ASSERT_SHMEM(destination, kSize);
+    EXPECT_EQ(ReportedAllocationSize(), baseline + kSize);
+  }
+
+  EXPECT_EQ(ReportedAllocationSize(), baseline);
+}
+
+TEST_F(SharedMemoryInternalTest, MoveAssignmentCounterToPopulated) {
+  static constexpr uint64_t kSourceSize = 4096;
+  static constexpr uint64_t kDestinationSize = 1024;
+  const uint64_t baseline = AllocationBaseline();
+
+  {
+    auto source = shared_memory::Create(kSourceSize);
+    auto destination = shared_memory::Create(kDestinationSize);
+    EXPECT_EQ(ReportedAllocationSize(),
+              baseline + kSourceSize + kDestinationSize);
+
+    destination = std::move(source);
+    ASSERT_SHMEM(source, 0);
+    ASSERT_SHMEM(destination, kSourceSize);
+    EXPECT_EQ(ReportedAllocationSize(), baseline + kSourceSize);
+  }
+
+  EXPECT_EQ(ReportedAllocationSize(), baseline);
+}
+
+TEST_F(SharedMemoryInternalTest, SelfMoveAssignmentCounter) {
+  static constexpr uint64_t kSize = 4096;
+  const uint64_t baseline = AllocationBaseline();
+
+  {
+    auto handle = shared_memory::Create(kSize);
+    ASSERT_SHMEM(handle, kSize);
+    auto& source = handle;
+    handle = std::move(source);
+    ASSERT_SHMEM(handle, kSize);
+    EXPECT_EQ(ReportedAllocationSize(), baseline + kSize);
+  }
+
+  EXPECT_EQ(ReportedAllocationSize(), baseline);
+}
+
+TEST_F(SharedMemoryInternalTest, MoveConstructorCounter) {
+  static constexpr uint64_t kSize = 4096;
+  const uint64_t baseline = AllocationBaseline();
+
+  {
+    auto source = shared_memory::Create(kSize);
+    shared_memory::MutableHandle destination(std::move(source));
+    ASSERT_SHMEM(source, 0);
+    ASSERT_SHMEM(destination, kSize);
+    EXPECT_EQ(ReportedAllocationSize(), baseline + kSize);
+  }
+
+  EXPECT_EQ(ReportedAllocationSize(), baseline);
+}
+
+TEST_F(SharedMemoryInternalTest, ConversionCounter) {
+  static constexpr uint64_t kSize = 4096;
+  const uint64_t baseline = AllocationBaseline();
+
+  {
+    auto source = shared_memory::Create(kSize);
+    auto destination = std::move(source).ToReadOnly();
+    ASSERT_SHMEM(source, 0);
+    ASSERT_SHMEM(destination, kSize);
+    EXPECT_EQ(ReportedAllocationSize(), baseline + kSize);
+  }
+
+  EXPECT_EQ(ReportedAllocationSize(), baseline);
 }
 
 TEST(IPCSharedMemoryHandle, ToReadOnly)

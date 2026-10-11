@@ -46,7 +46,10 @@ NS_IMPL_ISUPPORTS(AllocationReporter, nsIMemoryReporter)
 static void RegisterAllocationMemoryReporter() {
   static Atomic<bool> registered;
   if (registered.compareExchange(false, true)) {
-    RegisterStrongMemoryReporter(MakeAndAddRef<AllocationReporter>());
+    if (NS_FAILED(RegisterStrongMemoryReporter(
+            MakeAndAddRef<AllocationReporter>()))) {
+      registered = false;
+    }
   }
 }
 
@@ -62,8 +65,12 @@ HandleBase::~HandleBase() {
 }
 
 HandleBase& HandleBase::operator=(HandleBase&& aOther) {
-  mHandle = std::move(aOther.mHandle);
-  SetSize(std::exchange(aOther.mSize, 0));
+  if (this != &aOther) {
+    mHandle = std::move(aOther.mHandle);
+    SetSize(0);
+    // The source size is already included in the allocation counter.
+    mSize = std::exchange(aOther.mSize, 0);
+  }
   return *this;
 }
 
