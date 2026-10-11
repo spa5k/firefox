@@ -2399,7 +2399,17 @@ void Http3Session::CloseStreamInternal(Http3StreamBase* aStream,
   if (nsAHttpTransaction* transaction = aStream->Transaction()) {
     mStreamTransactionHash.Remove(transaction);
   }
-  mWebTransportSessions.RemoveElement(aStream);
+  if (mWebTransportSessions.RemoveElement(aStream)) {
+    // The stream-to-session mapping exists so that late RESET/STOP_SENDING
+    // notifications for a closed stream can still reach its session. Once
+    // the session itself is gone the mappings for its streams can no longer
+    // be used, so remove them here instead of keeping them for the lifetime
+    // of this connection.
+    uint64_t sessionStreamId = aStream->StreamId();
+    mWebTransportStreamToSessionMap.RemoveIf([sessionStreamId](const auto& aIter) {
+      return aIter.Data() == sessionStreamId;
+    });
+  }
   mWebTransportStreams.RemoveElement(aStream);
   mTunnelStreams.RemoveElement(aStream);
   // Close(NS_OK) implies that the NeqoHttp3Conn will be closed, so we can only

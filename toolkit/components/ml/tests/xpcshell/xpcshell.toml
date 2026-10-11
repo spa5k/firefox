@@ -8,3 +8,5 @@ prefs = [
 ]
 
 ["test_download_rs_attachment_failure.js"]
+
+["test_ml_engine_request_lifetimes.js"]
